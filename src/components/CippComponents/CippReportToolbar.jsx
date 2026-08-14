@@ -18,8 +18,14 @@ export const CippReportToolbar = () => {
   const [deleteDialog, setDeleteDialog] = useState({ open: false })
   const [refreshDialog, setRefreshDialog] = useState({ open: false })
 
+  const defaultReportId =
+    settings.UserSpecificSettings?.defaultTestSuite?.value ||
+    settings.defaultTestSuite?.value ||
+    'ztna'
   const selectedReport =
-    router.isReady && !router.query.reportId ? 'ztna' : router.query.reportId || 'ztna'
+    router.isReady && !router.query.reportId
+      ? defaultReportId
+      : router.query.reportId || defaultReportId
 
   const formControl = useForm({ mode: 'onChange' })
   const reportIdValue = useWatch({ control: formControl.control })
@@ -63,11 +69,13 @@ export const CippReportToolbar = () => {
     })
   }
 
-  const isBuiltIn = reports.find((r) => r.id === selectedReport)?.source === 'file'
+  const selectedReportObject = reports.find((r) => r.id === selectedReport)
+  const isBuiltIn = selectedReportObject?.source === 'file'
+  const selectedCustomReport = selectedReportObject?.type === 'custom' ? selectedReportObject : null
 
   return (
     <>
-      <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center' }}>
+      <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'center', width: '100%' }}>
         <Box sx={{ flex: 1 }}>
           <CippFormComponent
             name="reportId"
@@ -107,13 +115,6 @@ export const CippReportToolbar = () => {
           onClick={() => {
             setRefreshDialog({
               open: true,
-              title: 'Refresh Test Data',
-              message: `Are you sure you want to refresh the test data for ${currentTenant}? This might take up to 2 hours to update.`,
-              api: {
-                url: '/api/ExecTestRun',
-                data: { tenantFilter: currentTenant },
-                method: 'POST',
-              },
               handleClose: () => setRefreshDialog({ open: false }),
             })
           }}
@@ -121,6 +122,21 @@ export const CippReportToolbar = () => {
         >
           Refresh
         </Button>
+        <Tooltip
+          title={
+            isBuiltIn ? 'Built-in test suites cannot be edited' : 'Edit this custom test suite'
+          }
+          arrow
+        >
+          <Box component="span">
+            <CippAddTestReportDrawer
+              buttonText="Edit"
+              mode="edit"
+              reportToEdit={selectedCustomReport}
+              disabled={!selectedCustomReport}
+            />
+          </Box>
+        </Tooltip>
         <Tooltip
           title={
             isBuiltIn ? 'Built-in test suites cannot be deleted' : 'Delete this custom test suite'
@@ -159,26 +175,39 @@ export const CippReportToolbar = () => {
 
       <CippApiDialog
         createDialog={deleteDialog}
-        title="Delete Custom Report"
+        title="Delete Custom Test Suite"
         fields={[]}
         api={{
           url: '/api/DeleteTestReport',
           type: 'POST',
           data: { ReportId: selectedReport },
-          confirmText: 'Are you sure you want to delete this report? This action cannot be undone.',
+          confirmText: 'Are you sure you want to delete this test suite? This action cannot be undone.',
           relatedQueryKeys: ['ListTestReports'],
         }}
       />
 
       <CippApiDialog
         createDialog={refreshDialog}
-        title={refreshDialog.title}
-        fields={[]}
+        title="Refresh Test Data"
+        fields={[
+          {
+            type: 'radio',
+            name: 'mode',
+            label: 'What would you like to refresh?',
+            defaultValue: 'both',
+            options: [
+              { label: 'Cache & Tests (full refresh)', value: 'both' },
+              { label: 'Cache only (collect tenant data)', value: 'cache' },
+              { label: 'Tests only (re-run against existing cache)', value: 'tests' },
+            ],
+            validators: { required: 'Please select a refresh mode' },
+          },
+        ]}
         api={{
-          url: refreshDialog.api?.url,
+          url: '/api/ExecTestRun',
           type: 'POST',
-          data: refreshDialog.api?.data,
-          confirmText: refreshDialog.message,
+          data: { tenantFilter: currentTenant },
+          confirmText: `Choose what to refresh for ${currentTenant}. A full refresh can take up to 2 hours; tests-only is much faster when the cache is already populated.`,
           relatedQueryKeys: [`${currentTenant}-ListTests-${selectedReport}`],
         }}
       />
