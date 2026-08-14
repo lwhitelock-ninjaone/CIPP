@@ -16,10 +16,15 @@ import {
   Card,
   CardContent,
   CardHeader,
+  Checkbox,
+  FormControlLabel,
+  FormGroup,
+  CircularProgress,
 } from '@mui/material'
 import { Grid, Stack, Box } from '@mui/system'
 import { Layout as DashboardLayout } from '../../../../layouts/index.js'
 import { useSettings } from '../../../../hooks/use-settings'
+import { useBrandingSettings } from '../../../../components/CippPdf/useBrandingSettings'
 import { ApiGetCall, ApiPostCall } from '../../../../api/ApiCall.jsx'
 import { useForm, useWatch } from 'react-hook-form'
 import CippFormComponent from '../../../../components/CippComponents/CippFormComponent'
@@ -29,6 +34,12 @@ import CippButtonCard from '../../../../components/CippCards/CippButtonCard'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { renderCustomScriptMarkdownTemplate } from '../../../../utils/customScriptTemplate'
+import {
+  escapeTableCell,
+  isTableSeparatorRow,
+  normaliseTableRow,
+  parseTableRow,
+} from '../../../../utils/markdown-table'
 import {
   Add,
   Delete,
@@ -43,20 +54,57 @@ import {
   ArrowUpward,
   ArrowDownward,
   Refresh,
+  Storage,
+  GridOff,
 } from '@mui/icons-material'
+
 import {
+  MenuButtonAddTable,
   MenuButtonBold,
+  MenuButtonBulletedList,
+  MenuButtonCode,
+  MenuButtonCodeBlock,
   MenuButtonItalic,
+  MenuButtonOrderedList,
+  MenuButtonRedo,
+  MenuButtonStrikethrough,
+  MenuButtonUnderline,
+  MenuButtonUndo,
+  MenuButton,
   MenuControlsContainer,
   MenuDivider,
   MenuSelectHeading,
   RichTextEditor,
 } from 'mui-tiptap'
+import {
+  DeleteColumn,
+  DeleteRow,
+  InsertColumnLeft,
+  InsertColumnRight,
+  InsertRowBottom,
+  InsertRowTop,
+} from 'mui-tiptap/icons'
 import StarterKit from '@tiptap/starter-kit'
 import { Table, TableRow, TableHeader, TableCell } from '@tiptap/extension-table'
 import { Extension } from '@tiptap/core'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { ReportBuilderPDF } from '../../../../components/ReportBuilder/ReportBuilderPDF'
+import {
+  STRUCTURED_BLOCK_TYPES,
+  StructuredBlockCard,
+  createStructuredBlock,
+  isStructuredBlock,
+} from '../../../../components/ReportBuilder/ReportBuilderBlocks'
+import { PAGE_ORIENTATIONS, PAGE_SIZES } from '../../../../components/CippPdf'
+import {
+  DEFAULT_PAGE_SETTINGS,
+  DEFAULT_BRANDING_OPTION,
+  fromReportSettings,
+  resolveBranding,
+  resolvePresetId,
+  serialiseBlock,
+  toReportSettings,
+} from '../../../../components/ReportBuilder/reportSettings'
 import { useRouter } from 'next/router'
 
 /* ── Markdown styles (matches CippTestDetailOffCanvas) ── */
@@ -92,6 +140,14 @@ const markdownStyles = {
 }
 
 /* ── Simple markdown → HTML converter for TipTap editing ── */
+
+// Cell text is plain markdown, so anything angle-bracketed in it is data, not markup.
+const escapeHtml = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+
 const markdownToHtml = (md) => {
   if (!md) return ''
 
@@ -103,29 +159,20 @@ const markdownToHtml = (md) => {
     const line = lines[i]
 
     // Detect GFM table: current line has pipes and next line is separator (|---|---| etc)
-    if (
-      line.includes('|') &&
-      i + 1 < lines.length &&
-      lines[i + 1].trim().match(/^\|?[\s-:|]+\|[\s-:|]*\|?$/)
-    ) {
-      const headerCells = line
-        .split('|')
-        .map((c) => c.trim())
-        .filter((c) => c !== '')
+    if (line.includes('|') && i + 1 < lines.length && isTableSeparatorRow(lines[i + 1])) {
+      const headerCells = parseTableRow(line)
+      const columnCount = Math.max(headerCells.length, 1)
       let tableHtml = '<table><thead><tr>'
       headerCells.forEach((cell) => {
-        tableHtml += `<th>${cell}</th>`
+        tableHtml += `<th>${escapeHtml(cell)}</th>`
       })
       tableHtml += '</tr></thead><tbody>'
       i += 2 // skip header + separator
       while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
-        const cells = lines[i]
-          .split('|')
-          .map((c) => c.trim())
-          .filter((c) => c !== '')
+        const cells = normaliseTableRow(parseTableRow(lines[i]), columnCount)
         tableHtml += '<tr>'
         cells.forEach((cell) => {
-          tableHtml += `<td>${cell}</td>`
+          tableHtml += `<td>${escapeHtml(cell)}</td>`
         })
         tableHtml += '</tr>'
         i++
@@ -160,6 +207,47 @@ const markdownToHtml = (md) => {
     .replace(/\*(.*?)\*/g, '<em>$1</em>')
     .replace(/`(.*?)`/g, '<code>$1</code>')
     .replace(/\[(.*?)\]\((.*?)\)/g, '$1')
+}
+
+/* ── Table row/column controls ─────────────────────────────
+ * mui-tiptap's TableMenuControls renders a fixed set with no way to leave buttons out, so
+ * the subset the PDF can actually reproduce is composed here. Merge/split cells and the
+ * header toggles are deliberately absent: the PDF lays every row out on one fixed column
+ * grid, which a merged cell has no place in, and it decides a table has a heading from its
+ * first row being header cells — so toggling that off would cost the table its header bar
+ * and its repeat across page breaks.
+ */
+const TABLE_ACTIONS = [
+  { label: 'Insert column before', Icon: InsertColumnLeft, command: 'addColumnBefore' },
+  { label: 'Insert column after', Icon: InsertColumnRight, command: 'addColumnAfter' },
+  { label: 'Delete column', Icon: DeleteColumn, command: 'deleteColumn' },
+  null,
+  { label: 'Insert row above', Icon: InsertRowTop, command: 'addRowBefore' },
+  { label: 'Insert row below', Icon: InsertRowBottom, command: 'addRowAfter' },
+  { label: 'Delete row', Icon: DeleteRow, command: 'deleteRow' },
+  null,
+  { label: 'Delete table', Icon: GridOff, command: 'deleteTable' },
+]
+
+const TableControls = ({ editor }) => {
+  if (!editor) return null
+  return (
+    <>
+      {TABLE_ACTIONS.map((action, index) =>
+        action ? (
+          <MenuButton
+            key={action.command}
+            tooltipLabel={action.label}
+            IconComponent={action.Icon}
+            onClick={() => editor.chain().focus()[action.command]().run()}
+            disabled={!editor.can()[action.command]()}
+          />
+        ) : (
+          <MenuDivider key={`table-divider-${index}`} />
+        )
+      )}
+    </>
+  )
 }
 
 /* ── TipTap extension: convert pasted Markdown to HTML ── */
@@ -314,7 +402,9 @@ const ReportBlock = ({
         <RichTextEditor
           immediatelyRender={false}
           extensions={[
-            StarterKit,
+            // The PDF styles three heading levels; offering six would let an author pick
+            // one that arrives as ordinary body text.
+            StarterKit.configure({ heading: { levels: [1, 2, 3] } }),
             Table.configure({ resizable: false }),
             TableRow,
             TableHeader,
@@ -331,12 +421,34 @@ const ReportBlock = ({
               onUpdate(index, { ...block, content: editor.getHTML() })
             }
           }}
-          renderControls={() => (
+          renderControls={(editor) => (
+            /* Only controls the PDF renderer honours belong here — anything else would let
+               an author style a block that then flattens out in the exported report. */
             <MenuControlsContainer>
               <MenuSelectHeading />
               <MenuDivider />
               <MenuButtonBold />
               <MenuButtonItalic />
+              <MenuButtonUnderline />
+              <MenuButtonStrikethrough />
+              <MenuButtonCode />
+              <MenuDivider />
+              <MenuButtonBulletedList />
+              <MenuButtonOrderedList />
+              <MenuButtonCodeBlock />
+              <MenuDivider />
+              <MenuButtonAddTable />
+              <MenuDivider />
+              <MenuButtonUndo />
+              <MenuButtonRedo />
+              {/* Row/column tools join the toolbar while the caret is in a table, rather
+                  than floating over the cell being edited. */}
+              {editor?.isActive('table') && (
+                <>
+                  <MenuDivider />
+                  <TableControls editor={editor} />
+                </>
+              )}
             </MenuControlsContainer>
           )}
         />
@@ -358,12 +470,334 @@ const ReportBlock = ({
   )
 }
 
+/* ── Default excluded headers for database blocks ───────── */
+const DB_DEFAULT_EXCLUDED = ['id', 'rowkey', 'partitionkey', 'etag', 'timestamp']
+
+/* ── DatabaseBlock ────────────────────────────────────────── */
+const DatabaseBlock = ({
+  block,
+  index,
+  totalBlocks,
+  onRemove,
+  onUpdate,
+  onMoveUp,
+  onMoveDown,
+  currentTenant,
+}) => {
+  const [allHeaders, setAllHeaders] = useState(block.allHeaders || [])
+  const processedRef = useRef(false)
+  const prevTenantRef = useRef(currentTenant)
+
+  // Reset processed flag synchronously when tenant changes so new data is always processed
+  if (prevTenantRef.current !== currentTenant) {
+    prevTenantRef.current = currentTenant
+    processedRef.current = false
+  }
+
+  const dbCacheApi = ApiGetCall({
+    url: '/api/ListDBCache',
+    data: { tenantFilter: currentTenant, type: block.dbType },
+    queryKey: `ListDBCache-${currentTenant}-${block.dbType}`,
+    waiting: !!currentTenant && !!block.dbType,
+  })
+
+  // Process results when API data arrives (or is empty)
+  useEffect(() => {
+    if (!dbCacheApi.isSuccess || processedRef.current) return
+    processedRef.current = true
+    const results = dbCacheApi.data?.Results
+    if (!results || (Array.isArray(results) && results.length === 0)) {
+      setAllHeaders([])
+      onUpdate(index, {
+        ...block,
+        data: results ?? [],
+        allHeaders: [],
+        selectedHeaders: [],
+        content: '',
+      })
+      return
+    }
+    const headerSet = new Set()
+    if (Array.isArray(results)) {
+      results.forEach((row) => Object.keys(row).forEach((k) => headerSet.add(k)))
+    } else if (results && typeof results === 'object') {
+      Object.keys(results).forEach((k) => headerSet.add(k))
+    }
+    const headers = [...headerSet].sort()
+    setAllHeaders(headers)
+    const selectedHeaders =
+      block.selectedHeaders && block.selectedHeaders.length > 0
+        ? block.selectedHeaders
+        : headers.filter((h) => !DB_DEFAULT_EXCLUDED.includes(h.toLowerCase()))
+    onUpdate(index, {
+      ...block,
+      data: results,
+      allHeaders: headers,
+      selectedHeaders,
+      content: formatDatabaseContent(results, selectedHeaders, block.format || 'text'),
+    })
+  }, [dbCacheApi.isSuccess, dbCacheApi.data])
+
+  const handleRefresh = () => {
+    processedRef.current = false
+    dbCacheApi.refetch()
+  }
+
+  const error = dbCacheApi.isError
+    ? dbCacheApi.error?.response?.data?.Results ||
+      dbCacheApi.error?.message ||
+      'Failed to fetch data'
+    : null
+
+  const handleHeaderToggle = (header) => {
+    const current = block.selectedHeaders || []
+    const next = current.includes(header)
+      ? current.filter((h) => h !== header)
+      : [...current, header]
+    const newContent = formatDatabaseContent(block.data || [], next, block.format || 'text')
+    onUpdate(index, { ...block, selectedHeaders: next, content: newContent })
+  }
+
+  const handleSelectAll = () => {
+    const newContent = formatDatabaseContent(block.data || [], allHeaders, block.format || 'text')
+    onUpdate(index, { ...block, selectedHeaders: [...allHeaders], content: newContent })
+  }
+
+  const handleDeselectAll = () => {
+    onUpdate(index, { ...block, selectedHeaders: [], content: '' })
+  }
+
+  const handleFormatChange = (newFormat) => {
+    const newContent = formatDatabaseContent(
+      block.data || [],
+      block.selectedHeaders || [],
+      newFormat
+    )
+    onUpdate(index, { ...block, format: newFormat, content: newContent })
+  }
+
+  const dbTypeLabel = block.title || block.dbType
+
+  return (
+    <CippButtonCard
+      title={
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Storage fontSize="small" color="primary" />
+          <Typography variant="subtitle2" fontWeight={600}>
+            {block.title || dbTypeLabel}
+          </Typography>
+          <Chip label="Database" size="small" color="primary" variant="outlined" />
+          <Chip
+            label={(block.format || 'text').toUpperCase()}
+            size="small"
+            color="secondary"
+            variant="outlined"
+          />
+          {Array.isArray(block.data) && block.data.length > 0 && (
+            <Chip label={`${block.data.length} rows`} size="small" variant="outlined" />
+          )}
+        </Box>
+      }
+      cardActions={
+        <Stack direction="row" spacing={0.5} alignItems="center">
+          <Tooltip title="Refresh data">
+            <span>
+              <IconButton
+                size="small"
+                onClick={handleRefresh}
+                disabled={dbCacheApi.isFetching || !currentTenant}
+              >
+                {dbCacheApi.isFetching ? (
+                  <CircularProgress size={16} />
+                ) : (
+                  <Refresh fontSize="small" />
+                )}
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title="Move up">
+            <span>
+              <IconButton size="small" onClick={() => onMoveUp(index)} disabled={index === 0}>
+                <ArrowUpward fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title="Move down">
+            <span>
+              <IconButton
+                size="small"
+                onClick={() => onMoveDown(index)}
+                disabled={index === totalBlocks - 1}
+              >
+                <ArrowDownward fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title="Remove block">
+            <IconButton size="small" color="error" onClick={() => onRemove(index)}>
+              <Delete fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        </Stack>
+      }
+    >
+      {error && (
+        <Alert severity="error" sx={{ mb: 1 }}>
+          {error}
+        </Alert>
+      )}
+      {(dbCacheApi.isFetching ||
+        (!!currentTenant && !!block.dbType && !dbCacheApi.isSuccess && !dbCacheApi.isError)) && (
+        <Stack spacing={1}>
+          <Skeleton variant="text" width="80%" />
+          <Skeleton variant="text" width="60%" />
+          <Skeleton variant="rounded" height={60} />
+        </Stack>
+      )}
+      {!dbCacheApi.isFetching && dbCacheApi.isSuccess && block.data && allHeaders.length > 0 && (
+        <Box sx={{ mb: 2 }}>
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+            <Typography variant="caption" fontWeight={600}>
+              Format:
+            </Typography>
+            {['text', 'csv', 'json'].map((fmt) => (
+              <Chip
+                key={fmt}
+                label={fmt.toUpperCase()}
+                size="small"
+                color={block.format === fmt ? 'primary' : 'default'}
+                onClick={() => handleFormatChange(fmt)}
+                variant={block.format === fmt ? 'filled' : 'outlined'}
+                sx={{ cursor: 'pointer' }}
+              />
+            ))}
+          </Stack>
+          <Typography variant="caption" fontWeight={600} sx={{ mb: 0.5, display: 'block' }}>
+            Columns ({(block.selectedHeaders || []).length}/{allHeaders.length}):
+          </Typography>
+          <Stack direction="row" spacing={1} sx={{ mb: 0.5 }}>
+            <Button size="small" variant="text" onClick={handleSelectAll}>
+              Select All
+            </Button>
+            <Button size="small" variant="text" onClick={handleDeselectAll}>
+              Deselect All
+            </Button>
+          </Stack>
+          <FormGroup row sx={{ maxHeight: 120, overflow: 'auto' }}>
+            {allHeaders.map((header) => (
+              <FormControlLabel
+                key={header}
+                control={
+                  <Checkbox
+                    size="small"
+                    checked={(block.selectedHeaders || []).includes(header)}
+                    onChange={() => handleHeaderToggle(header)}
+                  />
+                }
+                label={<Typography variant="caption">{header}</Typography>}
+                sx={{ mr: 2 }}
+              />
+            ))}
+          </FormGroup>
+        </Box>
+      )}
+      {!dbCacheApi.isFetching && dbCacheApi.isSuccess && block.data && block.content && (
+        <Box sx={{ maxHeight: 300, overflow: 'auto' }}>
+          {block.format === 'text' ? (
+            <Box sx={markdownStyles}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{block.content}</ReactMarkdown>
+            </Box>
+          ) : (
+            <Box
+              component="pre"
+              sx={{
+                fontSize: '0.75rem',
+                backgroundColor: 'action.hover',
+                p: 1.5,
+                borderRadius: 1,
+                overflow: 'auto',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-all',
+              }}
+            >
+              {block.content}
+            </Box>
+          )}
+        </Box>
+      )}
+      {!dbCacheApi.isFetching && dbCacheApi.isSuccess && block.data && !block.content && (
+        <Typography color="text.secondary" variant="body2">
+          No data available for this tenant.
+        </Typography>
+      )}
+      {!dbCacheApi.isFetching && !dbCacheApi.isSuccess && !error && (
+        <Typography color="text.secondary" variant="body2">
+          {currentTenant ? 'Loading database data...' : 'Select a tenant to load database data.'}
+        </Typography>
+      )}
+    </CippButtonCard>
+  )
+}
+
+/* ── Format database content helper ─────────────────────── */
+const formatDatabaseContent = (data, selectedHeaders, format) => {
+  if (!data || !selectedHeaders || selectedHeaders.length === 0) return ''
+
+  // Normalize: data can be an array of rows or a single object
+  const rows = Array.isArray(data) ? data : [data]
+  if (rows.length === 0) return ''
+
+  const filtered = rows.map((row) => {
+    const obj = {}
+    selectedHeaders.forEach((h) => {
+      obj[h] = row[h] !== undefined && row[h] !== null ? row[h] : ''
+    })
+    return obj
+  })
+
+  if (format === 'json') {
+    return JSON.stringify(Array.isArray(data) ? filtered : filtered[0], null, 2)
+  }
+
+  if (format === 'csv') {
+    const escaped = (val) => {
+      const str = typeof val === 'object' ? JSON.stringify(val) : String(val ?? '')
+      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+        return `"${str.replace(/"/g, '""')}"`
+      }
+      return str
+    }
+    const header = selectedHeaders.map(escaped).join(',')
+    const dataRows = filtered.map((row) => selectedHeaders.map((h) => escaped(row[h])).join(','))
+    return [header, ...dataRows].join('\n')
+  }
+
+  // text format — generate a Markdown table
+  const header = '| ' + selectedHeaders.map(escapeTableCell).join(' | ') + ' |'
+  const separator = '| ' + selectedHeaders.map(() => '---').join(' | ') + ' |'
+  const dataRows = filtered.map((row) => {
+    return (
+      '| ' +
+      selectedHeaders
+        .map((h) => {
+          const val = row[h]
+          if (val === null || val === undefined) return ''
+          if (typeof val === 'object') return escapeTableCell(JSON.stringify(val))
+          return escapeTableCell(val)
+        })
+        .join(' | ') +
+      ' |'
+    )
+  })
+  return [header, separator, ...dataRows].join('\n')
+}
+
 /* ── Page ─────────────────────────────────────────────────── */
 const Page = () => {
   const router = useRouter()
   const settings = useSettings()
   const { currentTenant } = settings
-  const brandingSettings = settings.customBranding
+  const brandingSettings = useBrandingSettings()
 
   /* ── Deeplink: load template by ID from URL ── */
   const [templateId, setTemplateId] = useState(null)
@@ -385,28 +819,62 @@ const Page = () => {
   const [saveOpen, setSaveOpen] = useState(false)
 
   const saveForm = useForm({ defaultValues: { templateName: '' } })
-  const addBlockForm = useForm({ defaultValues: { blockType: null, selectedTest: [] } })
-  const settingsForm = useForm({ defaultValues: { removeRemediation: true } })
+  const addBlockForm = useForm({
+    defaultValues: {
+      blockType: null,
+      testSuite: null,
+      selectedTest: [],
+      dbCacheType: null,
+      dbFormat: null,
+    },
+  })
+  const settingsForm = useForm({
+    defaultValues: { removeRemediation: true, includeRawAttachments: false },
+  })
+  const pageSetupForm = useForm({ defaultValues: { ...DEFAULT_PAGE_SETTINGS } })
+  const pageSetupValues = useWatch({ control: pageSetupForm.control })
+  const hasDatabaseBlocks = blocks.some((b) => b.type === 'database')
   const scheduleForm = useForm({
     defaultValues: { scheduleName: '', recurrence: null, postExecution: [] },
   })
 
   const watchBlockType = useWatch({ control: addBlockForm.control, name: 'blockType' })
+  const watchTestSuite = useWatch({ control: addBlockForm.control, name: 'testSuite' })
   const watchSelectedTest = useWatch({ control: addBlockForm.control, name: 'selectedTest' })
+  const watchDbCacheType = useWatch({ control: addBlockForm.control, name: 'dbCacheType' })
+  const watchDbFormat = useWatch({ control: addBlockForm.control, name: 'dbFormat' })
   const removeRemediation = useWatch({ control: settingsForm.control, name: 'removeRemediation' })
 
-  // CippFormCondition clearOnHide sets selectedTest to null; coerce back to [] so
-  // CippAutoComplete (multiple) doesn't wrap null into [null] → empty chip.
+  // Fetch available DB cache types dynamically when tenant changes
+  const availableCacheTypesApi = ApiGetCall({
+    url: '/api/ListDBCache',
+    data: { tenantFilter: currentTenant, type: '_availableTypes' },
+    queryKey: `ListDBCache-availableTypes-${currentTenant}`,
+    waiting: !!currentTenant,
+  })
+
+  const availableCacheTypes = useMemo(() => {
+    if (!availableCacheTypesApi.isSuccess || !availableCacheTypesApi.data?.Results) return []
+    const types = availableCacheTypesApi.data.Results
+    return (Array.isArray(types) ? types : []).map((t) => ({ label: t, value: t }))
+  }, [availableCacheTypesApi.isSuccess, availableCacheTypesApi.data])
+
+  // When block type changes, reset suite and test selections.
   useEffect(() => {
-    const val = addBlockForm.getValues('selectedTest')
-    if (val === null || val === undefined) {
-      addBlockForm.setValue('selectedTest', [], { shouldDirty: false, shouldValidate: false })
-    }
+    addBlockForm.setValue('testSuite', null, { shouldDirty: false, shouldValidate: false })
+    addBlockForm.setValue('selectedTest', [], { shouldDirty: false, shouldValidate: false })
+    addBlockForm.setValue('dbCacheType', null, { shouldDirty: false, shouldValidate: false })
+    addBlockForm.setValue('dbFormat', null, { shouldDirty: false, shouldValidate: false })
   }, [watchBlockType])
+
+  // When test suite changes, reset test selection.
+  useEffect(() => {
+    addBlockForm.setValue('selectedTest', [], { shouldDirty: false, shouldValidate: false })
+  }, [watchTestSuite])
 
   /* ── API hooks ── */
   const templatesApi = ApiGetCall({
-    url: '/api/ListReportBuilderTemplates',
+    url: '/api/ListReportBuilderTemplates?tenantFilter=' + currentTenant,
     queryKey: `ListReportBuilderTemplates-builder-${templateId}`,
     waiting: !!templateId,
   })
@@ -429,6 +897,46 @@ const Page = () => {
     queryKey: `${currentTenant}-ListGraphRequest-organization-reportbuilder`,
     waiting: !!currentTenant,
   })
+
+  // Image data is needed here, not just names — the preview renders the preset's logo and cover.
+  const brandingPresetsApi = ApiGetCall({
+    url: '/api/ListBrandingPresets',
+    data: { includeImages: true },
+    queryKey: 'ListBrandingPresets-withImages',
+  })
+
+  const brandingPresets = useMemo(
+    () => (Array.isArray(brandingPresetsApi.data) ? brandingPresetsApi.data : []),
+    [brandingPresetsApi.data]
+  )
+
+  const presetOptions = useMemo(
+    () => [
+      DEFAULT_BRANDING_OPTION,
+      ...brandingPresets.map((preset) => ({ label: preset.name, value: preset.id })),
+    ],
+    [brandingPresets]
+  )
+
+  const reportSettings = useMemo(() => toReportSettings(pageSetupValues || {}), [pageSetupValues])
+
+  // A template that has not picked a preset falls back to whichever one branding settings names as
+  // the default for report-builder reports.
+  const activePresetId = resolvePresetId(
+    reportSettings.brandingPresetId,
+    brandingSettings,
+    'reportBuilder'
+  )
+
+  const effectiveBranding = useMemo(
+    () => resolveBranding(brandingSettings, brandingPresets, activePresetId),
+    [activePresetId, brandingPresets, brandingSettings]
+  )
+
+  const missingPreset =
+    !!reportSettings.brandingPresetId &&
+    brandingPresetsApi.isSuccess &&
+    !brandingPresets.some((preset) => preset.id === reportSettings.brandingPresetId)
 
   const tenantDisplayName =
     organizationApi.data?.Results?.[0]?.displayName || currentTenant || 'Organization'
@@ -461,20 +969,33 @@ const Page = () => {
       value: t.id,
       category: 'Identity',
       name: t.name,
+      testFolder: t.testFolder,
     })),
     ...(availableTests.DevicesTests || []).map((t) => ({
       label: `[Devices] ${t.name}`,
       value: t.id,
       category: 'Devices',
       name: t.name,
+      testFolder: t.testFolder,
     })),
     ...(availableTests.CustomTests || []).map((t) => ({
       label: `[Custom] ${t.name}`,
       value: t.id,
       category: 'Custom',
       name: t.name,
+      testFolder: t.testFolder || 'Custom',
     })),
   ]
+
+  const suiteOptions = useMemo(() => {
+    const folders = [...new Set(allTestOptions.map((t) => t.testFolder).filter(Boolean))]
+    return folders.sort().map((f) => ({ label: f, value: f }))
+  }, [allTestOptions])
+
+  const filteredTestOptions = useMemo(() => {
+    if (!watchTestSuite?.value) return allTestOptions
+    return allTestOptions.filter((t) => t.testFolder === watchTestSuite.value)
+  }, [allTestOptions, watchTestSuite])
 
   const testResults = useMemo(() => testsApi.data?.TestResults || [], [testsApi.data])
 
@@ -505,18 +1026,20 @@ const Page = () => {
         if (desc) parts.push(desc)
       }
 
+      // Mirror CippTestDetailOffCanvas: a script that emitted its own markdown wins over
+      // the template renderer, whose empty-template fallback dumps raw JSON.
       let resultContent = ''
-      if (result.TestType === 'Custom' && result.ResultDataJson) {
+      if (result.ResultMarkdown) {
+        resultContent = result.ResultMarkdown
+      } else if (result.TestType === 'Custom' && result.ResultDataJson) {
         try {
           resultContent = renderCustomScriptMarkdownTemplate(
             JSON.parse(result.ResultDataJson),
             result.MarkdownTemplate || ''
           )
         } catch {
-          resultContent = result.ResultMarkdown || ''
+          resultContent = ''
         }
-      } else {
-        resultContent = result.ResultMarkdown || ''
       }
 
       resultContent = maybeStripRemediation(resultContent)
@@ -553,10 +1076,18 @@ const Page = () => {
           content:
             b.type === 'blank'
               ? b.content || ''
-              : b.type === 'test' && !b.static
-                ? getTestContent(b.testId)
-                : b.content || '',
+              : b.type === 'database'
+                ? b.content || ''
+                : b.type === 'test' && !b.static
+                  ? getTestContent(b.testId)
+                  : b.content || '',
           status: b.type === 'test' ? b.status || getTestStatus(b.testId) : undefined,
+          // Preserve database block metadata
+          data: b.type === 'database' ? b.data || null : undefined,
+          allHeaders: b.type === 'database' ? b.allHeaders || [] : undefined,
+          selectedHeaders: b.type === 'database' ? b.selectedHeaders || [] : undefined,
+          dbType: b.dbType || undefined,
+          format: b.format || undefined,
         }))
       } catch {
         templateBlocks = []
@@ -564,16 +1095,44 @@ const Page = () => {
       setBlocks(templateBlocks)
       setTemplateGUID(found.GUID || found.RowKey || null)
       saveForm.setValue('templateName', found.Name || '')
+      // Templates saved before page setup existed have no Settings; the defaults reproduce
+      // exactly what those templates used to render.
+      let savedSettings = found.Settings
+      if (typeof savedSettings === 'string') {
+        try {
+          savedSettings = JSON.parse(savedSettings)
+        } catch {
+          savedSettings = null
+        }
+      }
+      pageSetupForm.reset(fromReportSettings(savedSettings, brandingPresets))
       templateLoadedRef.current = true
     }
-  }, [templateId, templatesApi.data, getTestContent, getTestStatus, saveForm])
+  }, [
+    templateId,
+    templatesApi.data,
+    getTestContent,
+    getTestStatus,
+    saveForm,
+    pageSetupForm,
+    brandingPresets,
+  ])
 
   /* ── Block operations ── */
   const handleAddBlock = () => {
     const type = addBlockForm.getValues('blockType')
     if (!type) return
 
-    if (type.value === 'blank') {
+    if (isStructuredBlock(type.value)) {
+      setBlocks((prev) => [...prev, createStructuredBlock(type.value, `block-${Date.now()}`)])
+      addBlockForm.reset({
+        blockType: null,
+        testSuite: null,
+        selectedTest: [],
+        dbCacheType: null,
+        dbFormat: null,
+      })
+    } else if (type.value === 'blank') {
       setBlocks((prev) => [
         ...prev,
         {
@@ -584,7 +1143,13 @@ const Page = () => {
           static: false,
         },
       ])
-      addBlockForm.reset({ blockType: null, selectedTest: [] })
+      addBlockForm.reset({
+        blockType: null,
+        testSuite: null,
+        selectedTest: [],
+        dbCacheType: null,
+        dbFormat: null,
+      })
     } else if (type.value === 'test') {
       const tests = addBlockForm.getValues('selectedTest')
       const testArray = Array.isArray(tests) ? tests : tests ? [tests] : []
@@ -602,7 +1167,40 @@ const Page = () => {
           static: false,
         })),
       ])
-      addBlockForm.reset({ blockType: null, selectedTest: [] })
+      addBlockForm.reset({
+        blockType: null,
+        testSuite: null,
+        selectedTest: [],
+        dbCacheType: null,
+        dbFormat: null,
+      })
+    } else if (type.value === 'database') {
+      const dbType = addBlockForm.getValues('dbCacheType')
+      const dbFormat = addBlockForm.getValues('dbFormat')
+      if (!dbType?.value || !dbFormat?.value) return
+      const friendlyName = dbType.label || dbType.value
+      setBlocks((prev) => [
+        ...prev,
+        {
+          id: `block-${Date.now()}`,
+          type: 'database',
+          dbType: dbType.value,
+          format: dbFormat.value,
+          title: friendlyName,
+          content: '',
+          data: null,
+          allHeaders: [],
+          selectedHeaders: [],
+          static: false,
+        },
+      ])
+      addBlockForm.reset({
+        blockType: null,
+        testSuite: null,
+        selectedTest: [],
+        dbCacheType: null,
+        dbFormat: null,
+      })
     }
   }
 
@@ -647,20 +1245,13 @@ const Page = () => {
     const name = saveForm.getValues('templateName')
     if (!name?.trim()) return
     saveTemplateCall.mutate({
-      url: '/api/ExecReportBuilderTemplate',
+      url: '/api/ExecReportBuilderTemplate?tenantFilter=' + currentTenant,
       data: {
         Action: 'save',
         GUID: templateGUID || undefined,
         Name: name,
-        Blocks: blocks.map((b) => ({
-          type: b.type,
-          testId: b.testId || null,
-          testCategory: b.testCategory || null,
-          title: b.title,
-          content: b.type === 'blank' ? b.content : b.static ? b.content : null,
-          status: b.status || null,
-          static: b.type === 'blank' ? true : b.static,
-        })),
+        Blocks: blocks.map(serialiseBlock),
+        Settings: reportSettings,
       },
     })
   }
@@ -680,17 +1271,10 @@ const Page = () => {
         parameters: {
           TemplateName: name,
           TenantFilter: currentTenant,
-          Blocks: JSON.stringify(
-            blocks.map((b) => ({
-              type: b.type,
-              testId: b.testId || null,
-              testCategory: b.testCategory || null,
-              title: b.title,
-              content: b.type === 'blank' ? b.content : b.static ? b.content : null,
-              status: b.status || null,
-              static: b.type === 'blank' ? true : b.static,
-            }))
-          ),
+          IncludeRawAttachments:
+            settingsForm.getValues('includeRawAttachments') && hasDatabaseBlocks ? 'true' : 'false',
+          Blocks: JSON.stringify(blocks.map(serialiseBlock)),
+          Settings: JSON.stringify(reportSettings),
         },
         ScheduledTime: Math.floor(Date.now() / 1000),
         Recurrence: values.recurrence || { value: '0', label: 'Once' },
@@ -710,7 +1294,8 @@ const Page = () => {
           blocks={displayBlocks}
           tenantName={tenantDisplayName}
           templateName={saveForm.getValues('templateName') || 'Custom Report'}
-          brandingSettings={brandingSettings}
+          brandingSettings={effectiveBranding}
+          reportSettings={reportSettings}
         />
       )
       pdf(doc)
@@ -735,7 +1320,9 @@ const Page = () => {
   const addDisabled =
     !watchBlockType ||
     (watchBlockType?.value === 'test' &&
-      (!watchSelectedTest || (Array.isArray(watchSelectedTest) && watchSelectedTest.length === 0)))
+      (!watchSelectedTest ||
+        (Array.isArray(watchSelectedTest) && watchSelectedTest.length === 0))) ||
+    (watchBlockType?.value === 'database' && (!watchDbCacheType?.value || !watchDbFormat?.value))
 
   /* ── Resolve live test blocks with current data for PDF ── */
   const displayBlocks = blocks.map((block) =>
@@ -881,9 +1468,12 @@ const Page = () => {
                     label="Block Type"
                     formControl={addBlockForm}
                     multiple={false}
+                    creatable={false}
                     options={[
                       { label: 'Custom Block', value: 'blank' },
                       { label: 'Test Result', value: 'test' },
+                      { label: 'Database Data', value: 'database' },
+                      ...STRUCTURED_BLOCK_TYPES,
                     ]}
                   />
                 </Grid>
@@ -892,17 +1482,66 @@ const Page = () => {
                   compareType="valueEq"
                   compareValue="test"
                   formControl={addBlockForm}
-                  clearOnHide={true}
+                  clearOnHide={false}
                 >
-                  <Grid size={{ xs: 12, md: 4 }}>
+                  <Grid size={{ xs: 12, md: 2 }}>
+                    <CippFormComponent
+                      type="autoComplete"
+                      name="testSuite"
+                      label="Test Suite"
+                      formControl={addBlockForm}
+                      creatable={false}
+                      multiple={false}
+                      options={suiteOptions}
+                      isFetching={availableTestsApi.isFetching}
+                    />
+                  </Grid>
+                  <Grid size={{ xs: 12, md: 3 }}>
                     <CippFormComponent
                       type="autoComplete"
                       name="selectedTest"
                       label="Select Tests"
                       formControl={addBlockForm}
+                      creatable={false}
                       multiple={true}
-                      options={allTestOptions}
+                      options={filteredTestOptions}
                       isFetching={availableTestsApi.isFetching}
+                      disabled={!watchTestSuite?.value}
+                    />
+                  </Grid>
+                </CippFormCondition>
+                <CippFormCondition
+                  field="blockType"
+                  compareType="valueEq"
+                  compareValue="database"
+                  formControl={addBlockForm}
+                  clearOnHide={false}
+                >
+                  <Grid size={{ xs: 12, md: 3 }}>
+                    <CippFormComponent
+                      type="autoComplete"
+                      name="dbCacheType"
+                      label="Data Source"
+                      formControl={addBlockForm}
+                      creatable={false}
+                      multiple={false}
+                      options={availableCacheTypes}
+                      isFetching={availableCacheTypesApi.isFetching}
+                    />
+                  </Grid>
+                  <Grid size={{ xs: 12, md: 2 }}>
+                    <CippFormComponent
+                      type="autoComplete"
+                      name="dbFormat"
+                      label="Format"
+                      formControl={addBlockForm}
+                      creatable={false}
+                      multiple={false}
+                      options={[
+                        { label: 'Table (Text)', value: 'text' },
+                        { label: 'CSV', value: 'csv' },
+                        { label: 'JSON', value: 'json' },
+                      ]}
                     />
                   </Grid>
                 </CippFormCondition>
@@ -917,7 +1556,9 @@ const Page = () => {
                     Add Block
                   </Button>
                 </Grid>
-                <Grid size={{ xs: 12, md: 3 }} sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+              </Grid>
+              <Grid container spacing={2} sx={{ mt: 1 }}>
+                <Grid size={{ xs: 12, md: 4 }}>
                   <CippFormComponent
                     type="switch"
                     name="removeRemediation"
@@ -925,7 +1566,70 @@ const Page = () => {
                     formControl={settingsForm}
                   />
                 </Grid>
+                {hasDatabaseBlocks && (
+                  <Grid size={{ xs: 12, md: 4 }}>
+                    <CippFormComponent
+                      type="switch"
+                      name="includeRawAttachments"
+                      label="Include database items as email attachment"
+                      formControl={settingsForm}
+                    />
+                  </Grid>
+                )}
               </Grid>
+            </CippButtonCard>
+
+            {/* Page Setup */}
+            <CippButtonCard title="Page Setup & Branding">
+              <Grid container spacing={2}>
+                <Grid size={{ xs: 12, md: 3 }}>
+                  <CippFormComponent
+                    type="autoComplete"
+                    name="brandingPresetId"
+                    label="Branding"
+                    formControl={pageSetupForm}
+                    multiple={false}
+                    creatable={false}
+                    disableClearable={true}
+                    options={presetOptions}
+                    isFetching={brandingPresetsApi.isFetching}
+                  />
+                </Grid>
+                <Grid size={{ xs: 6, md: 2 }}>
+                  <CippFormComponent
+                    type="autoComplete"
+                    name="size"
+                    label="Page Size"
+                    formControl={pageSetupForm}
+                    multiple={false}
+                    creatable={false}
+                    disableClearable={true}
+                    options={PAGE_SIZES}
+                  />
+                </Grid>
+                <Grid size={{ xs: 6, md: 2 }}>
+                  <CippFormComponent
+                    type="autoComplete"
+                    name="orientation"
+                    label="Orientation"
+                    formControl={pageSetupForm}
+                    multiple={false}
+                    creatable={false}
+                    disableClearable={true}
+                    options={PAGE_ORIENTATIONS}
+                  />
+                </Grid>
+              </Grid>
+              {/* Cover, footer and watermark used to be overridden here as well. They are branding
+                  decisions, and branding presets now carry all of them — so a template says which
+                  branding to render against and nothing more. Two places to set the same thing is
+                  how a template ends up quietly contradicting the preset it points at. */}
+              {missingPreset && (
+                <Alert severity="warning" sx={{ mt: 2 }}>
+                  The branding preset saved with this template no longer exists — the global
+                  branding settings are being used instead.
+                </Alert>
+              )}
             </CippButtonCard>
 
             {/* Blocks */}
@@ -945,6 +1649,37 @@ const Page = () => {
                           status: getTestStatus(block.testId),
                         }
                       : block
+
+                  if (isStructuredBlock(block.type)) {
+                    return (
+                      <StructuredBlockCard
+                        key={block.id}
+                        block={block}
+                        index={index}
+                        totalBlocks={blocks.length}
+                        onRemove={handleRemoveBlock}
+                        onUpdate={handleUpdateBlock}
+                        onMoveUp={handleMoveBlockUp}
+                        onMoveDown={handleMoveBlockDown}
+                      />
+                    )
+                  }
+
+                  if (block.type === 'database') {
+                    return (
+                      <DatabaseBlock
+                        key={block.id}
+                        block={displayBlock}
+                        index={index}
+                        totalBlocks={blocks.length}
+                        onRemove={handleRemoveBlock}
+                        onUpdate={handleUpdateBlock}
+                        onMoveUp={handleMoveBlockUp}
+                        onMoveDown={handleMoveBlockDown}
+                        currentTenant={currentTenant}
+                      />
+                    )
+                  }
                   return (
                     <ReportBlock
                       key={block.id}
@@ -976,7 +1711,9 @@ const Page = () => {
         <DialogTitle
           sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
         >
-          <Typography variant="h6">Report Preview</Typography>
+          <Typography variant="h6" component="div">
+            Report Preview
+          </Typography>
           <IconButton onClick={() => setPreviewOpen(false)} size="small">
             <Close />
           </IconButton>
@@ -988,7 +1725,8 @@ const Page = () => {
               blocks={displayBlocks}
               tenantName={tenantDisplayName}
               templateName={saveForm.getValues('templateName') || 'Custom Report'}
-              brandingSettings={brandingSettings}
+              brandingSettings={effectiveBranding}
+              reportSettings={reportSettings}
               mode="preview"
             />
           )}
@@ -1014,7 +1752,10 @@ const Page = () => {
               name="templateName"
               label="Template Name"
               formControl={saveForm}
-              validators={{ required: 'Template name is required' }}
+              validators={{
+                required: 'Template name is required',
+                maxLength: { value: 256, message: 'Template name must be 256 characters or fewer' },
+              }}
             />
             <CippApiResults apiObject={saveTemplateCall} />
           </Stack>
